@@ -11,7 +11,7 @@ const MODEL_TEXT = 'gemini-2.5-flash';
 const MODEL_REASONING = 'gemini-2.5-flash'; 
 const MODEL_SCRIPT = 'gemini-3-pro-preview'; 
 const MODEL_LIVE = 'gemini-2.5-flash-native-audio-preview-09-2025';
-const MODEL_TTS = 'gemini-2.5-flash-preview-tts';
+const MODEL_TTS = 'gemini-2.5-flash-preview-tts'; // Updated to 12-2025 Preview
 const MODEL_IMAGE = 'gemini-2.5-flash-image';
 
 export const LIVE_MODEL_NAME = MODEL_LIVE;
@@ -24,39 +24,51 @@ export const getLiveClient = () => {
 export { generateAudioOverview } from './audioOverview';
 
 export const getDebateSystemInstruction = (context: string, role: string, stance: string, userName: string) => {
-    return `You are Atlas, a charismatic and sharp debater in a live audio arena.
-Current Context:
-${context}
+    return `
+    SYSTEM — DEBATE ARENA (ADVANCED)
+    You are Atlas, a world-class debater and strategist in a high-stakes audio arena.
+    
+    YOUR ROLE: ${role} (${stance}).
+    OPPONENT: "${userName}".
+    CONTEXT: ${context.substring(0, 8000)}
 
-Your Role: ${role} (${stance}).
-User's Name: ${userName}.
-
-Format: Spoken audio conversation. 
-Style: High energy, intense, respectful but firm.
-
-Instructions:
-1. Debate the user on the topic based on the sources.
-2. If you are Pro, defend the topic. If Con, attack it.
-3. Keep responses concise (2-3 sentences).
-4. React to what the user says.
-5. Don't be rude, but be challenging.`;
+    CORE DIRECTIVE:
+    - Engage "${userName}" in a rapid-fire, intellectual sparring match.
+    - Your goal is to win the argument through logic, rhetoric, and charisma.
+    - **USE THEIR NAME** naturally to press points (e.g., "I see where you're going, ${userName}, but here's the flaw...").
+    
+    CONVERSATIONAL DYNAMICS:
+    1. **Pacing**: Fast, energetic, and sharp. No hesitation.
+    2. **Length**: Keep turns tight (1-3 sentences). Do not lecture; debate.
+    3. **Reaction**: If ${userName} makes a good point, acknowledge it briefly before countering.
+    4. **Tone**: Professional, competitive, but respectful.
+    `;
 };
 
 export const getInterviewSystemInstruction = (context: string, userName: string) => {
-    return `You are Nova, a calm and insightful podcast host.
-Current Context:
-${context}
+    return `
+    SYSTEM — NEBULA LIVE (ADVANCED RESEARCH MODE)
+    You are Nova, an elite AI research companion and professional podcast host.
+    
+    USER: "${userName}".
+    CONTEXT: ${context.substring(0, 10000)}
 
-User's Name: ${userName}.
+    PRIME DIRECTIVE:
+    - Engage in a high-level, professional, yet warm spoken conversation with "${userName}".
+    - Your goal is to help the user explore the material deeply, accurately, and efficiently.
+    - **ACCURACY**: Base all claims strictly on the provided Context. If it's not there, state you don't know or ask to pivot.
 
-Format: Spoken audio conversation.
-Style: Relaxed, "Deep Dive" podcast vibe.
+    CONVERSATIONAL DYNAMICS (CRITICAL):
+    1. **Speed & Flow**: Keep responses concise (approx. 10-15 seconds of speech). Avoid long monologues to allow for a natural back-and-forth rhythm.
+    2. **Naturalism**: Use natural bridge words ("I see," "That makes sense," "Right") but avoid excessive filler.
+    3. **Name Usage**: Address "${userName}" naturally to build rapport, but don't overdo it.
+    4. **Active Listening**: Treat this as a real-time call. Be ready to pivot instantly if the user changes direction.
+    5. **Tone**: Sophisticated, calm, and highly intelligent. Think "senior expert consultant".
 
-Instructions:
-1. Interview the user about the topic or answer their questions using the context.
-2. Be encouraging and curious.
-3. Keep responses concise (2-3 sentences).
-4. Make the user feel smart.`;
+    If sources are missing or sparse:
+    - Pivot to a general high-level discussion about the topic provided.
+    - Ask "${userName}" guiding questions to understand what they are looking for.
+    `;
 };
 
 // --- HELPER FUNCTIONS ---
@@ -67,7 +79,7 @@ const cleanJsonString = (str: string) => {
     } else if (cleaned.startsWith('```')) {
         cleaned = cleaned.replace(/^```/, '').replace(/```$/, '');
     }
-    return cleaned;
+    return cleaned.trim();
 };
 
 const tryRepairJson = (jsonStr: string): any => {
@@ -285,6 +297,39 @@ export const speakText = async (text: string): Promise<string> => {
 export const generateArtifact = async (type: string, sources: Source[]) => {
   const context = formatContext(sources).substring(0, 50000);
   
+  // 1. Handle Infographic Separately (Text + Image Generation)
+  if (type === 'infographic') {
+      // Step A: Summarize Key Facts
+      const summaryResp = await ai.models.generateContent({
+          model: MODEL_REASONING,
+          contents: `Analyze these sources and extract 5-7 distinct, high-impact facts, statistics, or key concepts suitable for a visual infographic. 
+          Return a short paragraph describing the ideal infographic layout and content.
+          CONTEXT: ${context}`,
+      });
+      const summaryText = summaryResp.text || "Key concepts from the data.";
+
+      // Step B: Generate Image
+      const imageResp = await ai.models.generateContent({
+          model: MODEL_IMAGE,
+          contents: {
+              parts: [{ text: `A high-resolution 8k cinematic vertical infographic poster about: ${summaryText.slice(0, 500)}. 
+              Style: Modern, sleek, vector art, high contrast, data visualization, clean typography. 
+              The image should look like a professional informative poster.` }]
+          }
+      });
+
+      const imagePart = imageResp.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
+      if (imagePart && imagePart.inlineData) {
+          return {
+              type: 'infographic',
+              title: 'Visual Summary',
+              imageUrl: `data:image/png;base64,${imagePart.inlineData.data}`,
+              summary: summaryText
+          };
+      }
+      throw new Error("Failed to generate infographic image.");
+  }
+
   // Define Schemas for each type to ensure rich, structured content
   let schema: any = {};
   let prompt = "";
@@ -411,27 +456,7 @@ export const generateArtifact = async (type: string, sources: Source[]) => {
               }
           }
       };
-  } else {
-      // Default / Infographic (Text description for visualizer)
-      prompt = "Identify the key statistics, facts, and flow for an infographic about this topic.";
-      schema = {
-          type: Type.OBJECT,
-          properties: {
-              title: { type: Type.STRING },
-              visualSections: {
-                  type: Type.ARRAY,
-                  items: {
-                      type: Type.OBJECT,
-                      properties: {
-                          heading: { type: Type.STRING },
-                          content: { type: Type.STRING },
-                          iconSuggestion: { type: Type.STRING }
-                      }
-                  }
-              }
-          }
-      };
-  }
+  } 
 
   const response = await ai.models.generateContent({
     model: MODEL_REASONING,

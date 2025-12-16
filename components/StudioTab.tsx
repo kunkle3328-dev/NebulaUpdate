@@ -2,7 +2,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Notebook, Artifact, AudioOverviewDialogue } from '../types';
 import { useTheme, useJobs } from '../contexts';
-import { Play, Pause, Headphones, Wand2, Mic, FileText, Layout, Zap, Trash2, RefreshCw, Box, FileQuestion, ChevronDown, ChevronUp, Grid2X2, ListOrdered, HelpCircle, RotateCcw, RotateCw, Loader2, PlayCircle, MoreHorizontal, X, ArrowRight, ArrowLeft } from 'lucide-react';
+import { Play, Pause, Headphones, Wand2, Mic, FileText, Layout, Zap, Trash2, RefreshCw, Box, FileQuestion, ChevronDown, ChevronUp, Grid2X2, ListOrdered, HelpCircle, RotateCcw, RotateCw, Loader2, PlayCircle, MoreHorizontal, X, ArrowRight, ArrowLeft, Volume2, VolumeX, Clock, Image as ImageIcon } from 'lucide-react';
 import LiveSession from './LiveSession';
 import AudioOverviewPanel from './AudioOverviewPanel';
 import { synthesizeDialogueAudio } from '../services/audioOverview';
@@ -32,7 +32,44 @@ const ArtifactRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) => {
 
     if (!data) return <div className="text-slate-500">No content available.</div>;
 
-    // 1. FLASHCARDS
+    // 1. INFOGRAPHIC (IMAGE)
+    if (artifact.type === 'infographic' && data.imageUrl) {
+        return (
+            <div className="flex flex-col items-center h-full w-full max-w-4xl mx-auto px-4 overflow-y-auto custom-scrollbar">
+                <h2 className="text-2xl font-bold text-white mb-4">{data.title || "Infographic"}</h2>
+                <div className="relative w-full rounded-2xl overflow-hidden shadow-2xl border border-white/10 group">
+                    <img src={data.imageUrl} alt="Infographic" className="w-full h-auto object-contain" />
+                    <div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-6">
+                        <p className="text-sm text-slate-300">{data.summary}</p>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    // 2. FAQ GUIDE (FIXED: Question First)
+    if (artifact.type === 'faqGuide' && data.faqs) {
+        return (
+            <div className="max-w-3xl mx-auto h-full overflow-y-auto custom-scrollbar p-4">
+                <h2 className="text-3xl font-bold text-white mb-8">Frequently Asked Questions</h2>
+                <div className="space-y-6">
+                    {data.faqs.map((faq: any, i: number) => (
+                        <div key={i} className="p-6 bg-slate-900/50 rounded-xl border border-white/10">
+                            <h3 className="text-lg font-bold text-white mb-3 flex items-start gap-3">
+                                <span className={`text-${theme.colors.primary}-400`}>Q.</span>
+                                {faq.question}
+                            </h3>
+                            <div className="pl-6 border-l-2 border-slate-700 ml-1.5">
+                                <p className="text-slate-300 leading-relaxed">{faq.answer}</p>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            </div>
+        );
+    }
+
+    // 3. FLASHCARDS
     if (artifact.type === 'flashcards' && data.cards) {
         const card = data.cards[index];
         return (
@@ -65,7 +102,7 @@ const ArtifactRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) => {
         );
     }
 
-    // 2. QUIZ
+    // 4. QUIZ
     if (artifact.type === 'quiz' && data.questions) {
          const q = data.questions[index];
          const [selected, setSelected] = useState<number | null>(null);
@@ -112,7 +149,7 @@ const ArtifactRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) => {
          );
     }
 
-    // 3. SLIDE DECK
+    // 5. SLIDE DECK
     if (artifact.type === 'slideDeck' && data.slides) {
         const slide = data.slides[index];
         return (
@@ -141,7 +178,7 @@ const ArtifactRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) => {
         );
     }
 
-    // 4. LIST BASED (Roadmap, SWOT, Brief)
+    // 6. DEFAULT LIST BASED (Roadmap, SWOT, Brief)
     return (
         <div className="max-w-3xl mx-auto h-full overflow-y-auto custom-scrollbar p-1 px-4">
             {Object.entries(data).map(([key, value]) => {
@@ -188,6 +225,8 @@ const StudioTab: React.FC<Props> = ({ notebook, onUpdate }) => {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [isSynthesizing, setIsSynthesizing] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState(1.0);
+  const [isMuted, setIsMuted] = useState(false);
   
   // Artifact Viewing
   const [viewingArtifact, setViewingArtifact] = useState<Artifact | null>(null);
@@ -201,7 +240,6 @@ const StudioTab: React.FC<Props> = ({ notebook, onUpdate }) => {
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
 
-  // ... (Keep existing resize, audio context logic, etc.) ...
   useEffect(() => {
     const updateDims = () => {
         if (window.innerWidth < 640) {
@@ -218,6 +256,9 @@ const StudioTab: React.FC<Props> = ({ notebook, onUpdate }) => {
   const audioArtifact = (notebook.artifacts || []).find(a => a.type === 'audioOverview');
   const isGeneratingArtifact = jobs.some(j => j.notebookId === notebook.id && j.type !== 'audioOverview' && j.status === 'processing');
   
+  // Check specifically if an artifact type is regenerating
+  const isProcessingType = (type: string) => jobs.some(j => j.notebookId === notebook.id && j.type === type && j.status === 'processing');
+
   // Helper to parse Audio Content safely
   const audioContent = audioArtifact?.content as AudioOverviewDialogue | undefined;
   const audioUrl = audioContent?.audioUrl || (audioArtifact?.content?.audioUrl as string);
@@ -227,7 +268,6 @@ const StudioTab: React.FC<Props> = ({ notebook, onUpdate }) => {
     ? audioContent.turns.map(t => `${t.speaker}: ${t.text}`).join('\n\n')
     : (audioArtifact?.content?.script as string) || "";
 
-  // ... (Keep existing initAudioContext, drawVisualizer, togglePlay, skip, formatTime) ...
   useEffect(() => {
     return () => {
         if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
@@ -320,6 +360,19 @@ const StudioTab: React.FC<Props> = ({ notebook, onUpdate }) => {
       if (audioRef.current) audioRef.current.currentTime += seconds;
   };
   
+  const cycleSpeed = () => {
+    const rates = [1.0, 1.25, 1.5, 2.0, 0.5];
+    const nextIdx = rates.indexOf(playbackRate) + 1;
+    const nextRate = rates[nextIdx >= rates.length ? 0 : nextIdx];
+    setPlaybackRate(nextRate);
+    if(audioRef.current) audioRef.current.playbackRate = nextRate;
+  };
+
+  const toggleMute = () => {
+      setIsMuted(!isMuted);
+      if(audioRef.current) audioRef.current.muted = !isMuted;
+  };
+  
   const formatTime = (time: number) => {
     if (isNaN(time)) return "0:00";
     const minutes = Math.floor(time / 60);
@@ -377,7 +430,7 @@ const StudioTab: React.FC<Props> = ({ notebook, onUpdate }) => {
       switch(type) {
           case 'flashcards': return <RefreshCw size={18} />;
           case 'quiz': return <FileQuestion size={18} />;
-          case 'infographic': return <Layout size={18} />;
+          case 'infographic': return <ImageIcon size={18} />;
           case 'slideDeck': return <Box size={18} />;
           case 'executiveBrief': return <FileText size={18} />;
           case 'swotAnalysis': return <Grid2X2 size={18} />;
@@ -488,18 +541,41 @@ const StudioTab: React.FC<Props> = ({ notebook, onUpdate }) => {
                                         </div>
                                         
                                         {/* Title & Metadata */}
-                                        <div className="text-center z-20 px-4 w-full max-w-md mx-auto flex flex-col gap-2 mb-8">
+                                        <div className="text-center z-20 px-4 w-full max-w-md mx-auto flex flex-col gap-2 mb-6">
                                             <h2 className="text-2xl md:text-3xl font-bold text-white leading-tight drop-shadow-xl">{title || "Audio Overview"}</h2>
                                             <p className="text-sm text-slate-400 font-medium tracking-wide uppercase">AI Generated • {notebook.title}</p>
+                                        </div>
+
+                                        {/* Player Secondary Controls (Mute/Speed) */}
+                                        <div className="w-full max-w-lg flex justify-between px-6 mb-2">
+                                            <button 
+                                                onClick={toggleMute} 
+                                                className="text-xs font-bold text-slate-400 hover:text-white flex items-center gap-1.5 transition-colors"
+                                                title={isMuted ? "Unmute" : "Mute"}
+                                            >
+                                                {isMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
+                                                {isMuted ? "MUTED" : "VOL"}
+                                            </button>
+                                            <button 
+                                                onClick={cycleSpeed} 
+                                                className={`text-xs font-bold flex items-center gap-1.5 transition-colors ${playbackRate !== 1.0 ? `text-${theme.colors.primary}-400` : 'text-slate-400 hover:text-white'}`}
+                                                title="Playback Speed"
+                                            >
+                                                <span>{playbackRate}x</span>
+                                            </button>
                                         </div>
 
                                         {/* Progress Bar */}
                                         <div className="w-full max-w-lg z-30 mb-8 px-4 flex items-center gap-4 text-xs font-bold text-slate-400 font-mono">
                                             <span className="min-w-[40px] text-right">{formatTime(currentTime)}</span>
-                                            <div className="flex-1 relative h-2 bg-white/10 rounded-full overflow-hidden group cursor-pointer">
+                                            <div className="flex-1 relative h-2 bg-white/10 rounded-full group cursor-pointer shadow-inner">
                                                 <div 
-                                                    className={`absolute top-0 left-0 h-full bg-gradient-to-r from-${theme.colors.primary}-500 to-${theme.colors.secondary}-500 transition-all duration-100 ease-linear rounded-full`}
+                                                    className={`absolute top-0 left-0 h-full bg-gradient-to-r from-${theme.colors.primary}-500 to-${theme.colors.secondary}-500 transition-all duration-100 ease-linear rounded-full shadow-[0_0_10px_rgba(var(--color-${theme.colors.primary}),0.5)]`}
                                                     style={{ width: `${(currentTime / (duration || 1)) * 100}%` }}
+                                                ></div>
+                                                <div 
+                                                    className={`absolute top-1/2 -translate-y-1/2 w-4 h-4 bg-white rounded-full shadow-lg opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none`}
+                                                    style={{ left: `${(currentTime / (duration || 1)) * 100}%`, transform: 'translate(-50%, -50%)' }}
                                                 ></div>
                                                 <input
                                                     type="range"
@@ -604,36 +680,40 @@ const StudioTab: React.FC<Props> = ({ notebook, onUpdate }) => {
                             { id: 'swotAnalysis', label: 'SWOT Analysis', icon: Grid2X2 },
                             { id: 'projectRoadmap', label: 'Project Roadmap', icon: ListOrdered },
                             { id: 'faqGuide', label: 'FAQ Guide', icon: HelpCircle }
-                        ].map((item) => (
-                            <button
-                                key={item.id}
-                                onClick={() => handleGenerateArtifact(item.id as Artifact['type'])}
-                                disabled={isGeneratingArtifact}
-                                className={`p-4 glass-panel rounded-xl flex flex-col items-center gap-3 border border-white/5 hover:bg-white/5 transition-all group ${generatingType === item.id ? 'opacity-50' : ''}`}
-                            >
-                                <div className={`p-3 rounded-full bg-${theme.colors.primary}-500/10 text-${theme.colors.primary}-400 group-hover:scale-110 transition-transform`}>
-                                    <item.icon size={24} />
-                                </div>
-                                <span className="text-sm font-bold text-slate-300">{item.label}</span>
-                            </button>
-                        ))}
+                        ].map((item) => {
+                            const isGenerating = isProcessingType(item.id);
+                            return (
+                                <button
+                                    key={item.id}
+                                    onClick={() => handleGenerateArtifact(item.id as Artifact['type'])}
+                                    disabled={isGeneratingArtifact}
+                                    className={`relative p-4 glass-panel rounded-xl flex flex-col items-center gap-3 border border-white/5 hover:bg-white/5 transition-all group overflow-hidden ${generatingType === item.id ? 'opacity-100' : ''}`}
+                                >
+                                    {isGenerating && (
+                                        <div className="absolute inset-0 z-20 bg-black/60 backdrop-blur-sm flex flex-col items-center justify-center p-2 text-center animate-in fade-in">
+                                            <Loader2 className="animate-spin mb-1 text-white" size={24} />
+                                            <span className="text-xs font-bold text-white mb-1">Generating...</span>
+                                        </div>
+                                    )}
+                                    <div className={`p-3 rounded-full bg-${theme.colors.primary}-500/10 text-${theme.colors.primary}-400 group-hover:scale-110 transition-transform`}>
+                                        <item.icon size={24} />
+                                    </div>
+                                    <span className="text-sm font-bold text-slate-300">{item.label}</span>
+                                </button>
+                            );
+                        })}
                     </div>
                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         {(notebook.artifacts || []).filter(a => a.type !== 'audioOverview').map((artifact) => (
-                            <div key={artifact.id} className="glass-panel p-5 rounded-xl border border-white/5 flex items-start gap-4 group">
+                            <div key={artifact.id} className="glass-panel p-5 rounded-xl border border-white/5 flex items-start gap-4 group cursor-pointer hover:border-white/20 transition-all" onClick={() => setViewingArtifact(artifact)}>
                                 <div className={`p-3 rounded-lg bg-slate-800 text-${theme.colors.primary}-400`}>
                                     {getArtifactIcon(artifact.type)}
                                 </div>
                                 <div className="flex-1 min-w-0">
                                     <h4 className="font-bold text-slate-200 truncate">{artifact.title}</h4>
                                     <p className="text-xs text-slate-500 mt-1 capitalize">{artifact.status} • {new Date(artifact.createdAt).toLocaleDateString()}</p>
-                                    {artifact.status === 'completed' && (
-                                        <div className="mt-3 flex gap-2">
-                                            <button onClick={() => setViewingArtifact(artifact)} className="text-xs bg-white/5 hover:bg-white/10 px-3 py-1.5 rounded-lg text-white transition-colors">{artifact.type === 'slideDeck' ? 'Present' : 'View'}</button>
-                                        </div>
-                                    )}
                                 </div>
-                                <button onClick={() => handleDeleteArtifact(artifact.id)} className="p-2 text-slate-600 hover:text-rose-500 hover:bg-rose-500/10 rounded-lg transition-colors opacity-0 group-hover:opacity-100"><Trash2 size={16} /></button>
+                                <button onClick={(e) => { e.stopPropagation(); handleDeleteArtifact(artifact.id); }} className="p-2 text-slate-600 hover:text-rose-500 hover:bg-rose-500/10 rounded-lg transition-colors opacity-0 group-hover:opacity-100"><Trash2 size={16} /></button>
                             </div>
                         ))}
                     </div>

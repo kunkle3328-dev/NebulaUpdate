@@ -198,6 +198,15 @@ const NotebookView: React.FC<Props> = ({ notebook, onUpdate }) => {
                       ))}
                 </div>
             )}
+            
+            {/* Copyright Footer */}
+            {!isSidebarCollapsed && (
+                <div className="mt-4 pt-4 border-t border-white/5 text-center">
+                    <p className="text-[9px] text-slate-600 font-bold uppercase tracking-widest hover:text-slate-400 transition-colors cursor-default">
+                        ©2025 Created by Corey Dean
+                    </p>
+                </div>
+            )}
         </div>
       </nav>
 

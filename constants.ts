@@ -37,6 +37,15 @@ export const PODCAST_STYLES = [
   { id: 'Study Guide', label: 'Study Guide', desc: 'Educational, exam-prep focus', icon: 'GraduationCap' },
 ];
 
+// --- ADVANCED LEARNING STYLES (For Study Guide) ---
+export const STUDY_STYLES = [
+    { id: 'Socratic', label: 'Socratic Seminar', desc: 'The hosts teach via questioning. Deep critical thinking.' },
+    { id: 'Feynman', label: 'The Feynman Method', desc: 'Explain like I’m 5. Radical simplification of complex topics.' },
+    { id: 'Academic', label: 'Hardcore Academic', desc: 'Graduate-level density. Jargon is defined but used heavily.' },
+    { id: 'CaseStudy', label: 'Real-World Case Study', desc: 'Application focused. How does this work in practice?' },
+    { id: 'Drill', label: 'Rapid Fire Drill', desc: 'Intense fact-checking and memorization techniques.' }
+];
+
 export const LEARNING_INTENTS = [
   { id: 'Understand Basics', label: 'Mental Model', desc: 'Connect big ideas. Establish the foundation.' },
   { id: 'Exam Prep', label: 'Ace the Exam', desc: 'Definitions, dates, and rapid-fire memory checks.' },

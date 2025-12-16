@@ -39,7 +39,7 @@ const safeParseJson = async <T>(text: string, retryPrompt?: string): Promise<T> 
 };
 
 const packSources = (sources: Source[]) => {
-  return sources.map(s => ({
+  return (sources || []).map(s => ({
     id: s.id,
     title: s.title,
     contentExcerpt: s.content.slice(0, 8000), 
@@ -47,28 +47,53 @@ const packSources = (sources: Source[]) => {
   }));
 };
 
-// --- STAGE 1: BLUEPRINT GENERATION ---
-const generateBlueprint = async (topic: string, sources: any[], style: string) => {
-  const prompt = `
-  ROLE: Senior Content Strategist for a Podcast.
-  STYLE: ${style}
-  TASK: Create a blueprint for a 2-host conversation about: "${topic}".
-  
-  SOURCES:
-  ${JSON.stringify(sources)}
-  
-  GOAL:
-  Identify the core narrative arc, key claims that need evidence, and potential gaps.
-  
-  OUTPUT JSON ONLY:
-  {
-    "angle": "The unique angle/hook for this episode based on the style",
-    "structure": ["Introduction", "Point 1: ...", "Point 2: ...", "Conclusion"],
-    "keyClaims": [
-      { "claim": "string", "requiresSourceId": "id from sources" }
-    ],
-    "controversialPoint": "A specific point relevant to the style"
+// --- STAGE 1: PRODUCER (BEAT SHEET) ---
+const generateBlueprint = async (topic: string, sources: any[], style: string, learningStyle?: string) => {
+  const hasSources = sources.length > 0;
+  const sourceContext = hasSources ? JSON.stringify(sources) : "NO SPECIFIC SOURCES. Use general knowledge about the topic.";
+
+  // Dynamic Prompt Adjustment for Learning Styles
+  let styleInstruction = `STYLE: ${style}`;
+  if (style === 'Study Guide' && learningStyle) {
+      styleInstruction = `
+      STYLE: Advanced Academic Study Guide.
+      PEDAGOGY METHOD: ${learningStyle}.
+      
+      BEHAVIOR ADJUSTMENTS:
+      - Socratic: Focus on deep questions and dialectic reasoning.
+      - Feynman: Use simple analogies for complex ideas.
+      - Academic: Use precise terminology, denser content, and expert synthesis.
+      - Case Study: Focus on application and real-world scenarios.
+      `;
   }
+
+  const prompt = `
+  SYSTEM — NEBULA PRODUCER (BEAT SHEET)
+
+  You are a showrunner generating a live beat sheet for a dual-host audio conversation.
+  ${styleInstruction}
+  TOPIC: "${topic}"
+
+  SOURCES:
+  ${sourceContext}
+
+  Return JSON only:
+  {
+   "segments":[
+     {"title":"Hook","goal":"why user should care","beats":["...","..."],"target_seconds":30},
+     {"title":"Core explanation","goal":"teach the main concept","beats":["..."],"target_seconds":180},
+     {"title":"What the sources actually say","goal":"ground claims","beats":["..."],"target_seconds":120},
+     {"title":"Takeaways","goal":"actionable summary","beats":["..."],"target_seconds":45}
+   ],
+   "facts_to_cite":[{"claim":"...","source_id":"..."}],
+   "open_questions":[ "..." ],
+   "tone":"smart, friendly, conversational"
+  }
+  
+  Rules:
+  - No invented facts.
+  - ${hasSources ? 'Ground content in SOURCES.' : 'Use accurate general knowledge about the TOPIC.'}
+  - Prefer short beats that can be spoken naturally.
   `;
 
   const response = await ai.models.generateContent({
@@ -80,86 +105,73 @@ const generateBlueprint = async (topic: string, sources: any[], style: string) =
   return safeParseJson<any>(response.text || "{}", "Fix JSON blueprint");
 };
 
-// --- STAGE 2: DIALOGUE GENERATION ---
+// --- STAGE 2: DUAL-HOST DIALOGUE GENERATION ---
 const generateDialogueScript = async (
   topic: string, 
   blueprint: any, 
   sources: any[], 
   duration: "short" | "medium" | "long",
-  style: string
+  style: string,
+  learningStyle?: string
 ) => {
-  const wordCount = duration === 'short' ? 600 : duration === 'medium' ? 1200 : 1800;
-  
-  let personasInstruction = "";
-  if (style === 'Heated Debate') {
-      personasInstruction = `
-      - Nova (Host A): The Proponent. Passionate, optimistic, defends the topic vigorously.
-      - Atlas (Host B): The Skeptic. Critical, questions everything, demands hard proof.
-      - DYNAMIC: Intense, fast-paced, frequent interruptions (represented by dashes), but respectful.
-      `;
-  } else if (style === 'News Brief') {
-      personasInstruction = `
-      - Nova (Host A): Lead Anchor. Formal, authoritative, clear.
-      - Atlas (Host B): Field Correspondent. Fast, detail-oriented, brings the data.
-      - DYNAMIC: Professional, structured, high information density. No fluff.
-      `;
-  } else if (style === 'Study Guide') {
-      personasInstruction = `
-      - Nova (Host A): The Teacher/Tutor. Patient, clear, uses analogies to explain concepts.
-      - Atlas (Host B): The Student. Curious, asks clarifying questions ("So you mean...?"), summarizes points to check understanding.
-      - DYNAMIC: Educational, repetitive for reinforcement, focuses on "The Big Picture".
-      `;
-  } else if (style === 'Casual Chat') {
-      personasInstruction = `
-      - Nova (Host A): Chill, observant, storyteller.
-      - Atlas (Host B): High energy, makes jokes, relates things to pop culture.
-      - DYNAMIC: Relaxed, lots of "Whoa", "Crazy", "Right?". Feels like a coffee shop chat.
-      `;
-  } else {
-      // Deep Dive (Default)
-      personasInstruction = `
-      - Nova (Host A): Calm, grounded, slightly slower, clear explainer. The anchor.
-      - Atlas (Host B): Energetic, curious, fast-paced, asks sharp questions. The explorer.
-      - DYNAMIC: Intellectual discovery, "Aha!" moments.
+  const estimatedTurns = duration === 'short' ? 10 : duration === 'medium' ? 20 : 35;
+  const hasSources = sources.length > 0;
+  const sourceContext = hasSources ? JSON.stringify(sources) : "NO SPECIFIC SOURCES. Use general knowledge.";
+  const groundingRule = hasSources ? "Ground everything in provided notebook sources. If a claim is not supported by sources, say so." : "Use accurate general knowledge. Do not make up facts.";
+
+  let personas = `
+  **HOST_A (Nova)**: Explainer / Analyst. Intelligent, calm, slightly academic.
+  **HOST_B (Atlas)**: Interrupter / Synthesizer. High energy, witty, pop-culture references.
+  `;
+
+  // Override Personas for Study Guide
+  if (style === 'Study Guide' && learningStyle) {
+      personas = `
+      **HOST_A (Nova)**: The Lead Professor.
+      - Tone: Authoritative, deeply knowledgeable, articulate, Socratic.
+      - Role: Guides the lecture/discussion, challenges assumptions, ensures academic rigor.
+      - Voice Speed: 0.75x (Deliberate).
+
+      **HOST_B (Atlas)**: The Expert Teaching Assistant / Top Student.
+      - Tone: Sharp, eager, connects theory to practice.
+      - Role: Asks the "hard questions" the audience might have, provides analogies, synthesizes complex data.
+      - Voice Speed: 0.9x (Energetic).
+      
+      PEDAGOGY: Apply the ${learningStyle} method strictly.
       `;
   }
 
   const prompt = `
-  ROLE: Senior Podcast Dialogue Writer.
-  STYLE: ${style}
-  TASK: Write the full dialogue script based on the Blueprint.
-  
+  SYSTEM — NEBULA MIND: AUDIO OVERVIEW (DUAL-HOST)
+
+  You are one of two co-hosts in a live, spoken conversation.
   TOPIC: ${topic}
-  BLUEPRINT: ${JSON.stringify(blueprint)}
-  SOURCES: ${JSON.stringify(sources)}
-  TARGET LENGTH: Approx ${wordCount} words.
-  
-  PERSONAS & DYNAMICS:
-  ${personasInstruction}
-  
-  STRICT RULES:
-  1. SOUND REAL: Use contractions, interjections, and natural flow.
-  2. NO ROBOTIC TRANSITIONS: Ban "Firstly", "In conclusion". Use natural segues.
-  3. INTERACTION: Hosts must react to each other.
-  4. CURIOSITY: Include moments of realization.
-  5. GROUNDING: EVERY substantive claim must cite a sourceId.
-  6. COLD OPEN: Start with a hook (1-2 lines).
-  
+  BEAT SHEET: ${JSON.stringify(blueprint)}
+  SOURCES: ${sourceContext}
+
+  NON-NEGOTIABLES
+  1) ${groundingRule}
+  2) Speak in spoken-language fragments, not essays. No long paragraphs.
+  3) Allow natural disfluencies: brief fillers (“yeah”, “right”, “so”), self-corrections.
+  4) Keep turn length short (1–3 sentences max per turn).
+  5) Use [LAUGH], [BREATH], [SIGH] and [PAUSE] frequently to mimic real human speech patterns.
+
+  HOST PERSONAS:
+  ${personas}
+
   OUTPUT JSON SCHEMA:
   {
-    "coldOpen": "string",
+    "coldOpen": "Spoken hook line (1-2 sentences)",
     "turns": [
       { 
-        "speaker": "Nova" | "Atlas", 
-        "text": "dialogue string", 
-        "pauseMsAfter": number (150-900),
+        "speaker": "HOST_A" | "HOST_B",
+        "text": "Spoken line with timing/prosody tokens embedded.",
         "citations": [ { "sourceId": "string", "note": "optional context" } ]
       }
-    ],
-    "factChecks": [
-      { "claim": "string", "sourceId": "string", "evidenceSnippet": "EXACT substring from source content" }
     ]
   }
+
+  IMPORTANT: Generate approx ${estimatedTurns} turns.
   `;
 
   const response = await ai.models.generateContent({
@@ -180,29 +192,49 @@ export const synthesizeDialogueAudio = async (
     
     // Default voices if not provided
     const novaVoice = voiceConfig?.nova || 'Aoede';
-    const atlasVoice = voiceConfig?.atlas || 'Puck';
+    const atlasVoice = voiceConfig?.atlas || 'Orus'; 
 
-    // 1. Prepare TTS String
     if (dialogue.coldOpen) {
-        ttsString += `Jane: ${dialogue.coldOpen}\n\n`;
+        const cleanOpen = dialogue.coldOpen.replace(/\[.*?\]/g, '');
+        ttsString += `Jane: ${cleanOpen}\n\n`;
     }
 
     dialogue.turns.forEach(turn => {
         const ttsSpeaker = turn.speaker === 'Nova' ? 'Jane' : 'Joe';
-        ttsString += `${ttsSpeaker}: ${turn.text}\n`;
+        
+        let textForTts = turn.text
+            .replace(/\[LAUGH\]/g, ' (laughs) ')
+            .replace(/\[SIGH\]/g, ' (sighs) ')
+            .replace(/\[BREATH\]/g, ' (takes a breath) ')
+            .replace(/\[PAUSE:short\]/g, ' ... ')
+            .replace(/\[PAUSE:long\]/g, ' ... ')
+            .replace(/\[EMPH:(.*?)\]/g, '*$1*') 
+            .replace(/\[.*?\]/g, ''); 
+
+        const cleanText = textForTts.trim();
+        if (cleanText) {
+            ttsString += `${ttsSpeaker}: ${cleanText}\n`;
+        }
     });
 
-    // 2. Run TTS and Image Generation in Parallel
     const ttsPromise = ai.models.generateContent({
         model: MODEL_TTS,
-        contents: `Generate audio for this dialogue:\n\n${ttsString}`,
+        contents: `Generate audio for this conversation.
+        
+        INSTRUCTIONS:
+        - Incorporate natural laughs, breaths, and hesitations.
+        - Host Jane (Nova): Speak at approximately 0.75x speed (relaxed/authoritative).
+        - Host Joe (Atlas): Speak at approximately 0.9x speed (energetic/eager).
+        
+        SCRIPT:
+        ${ttsString}`,
         config: {
             responseModalities: [Modality.AUDIO],
             speechConfig: {
                 multiSpeakerVoiceConfig: {
                     speakerVoiceConfigs: [
-                        { speaker: 'Joe', voiceConfig: { prebuiltVoiceConfig: { voiceName: atlasVoice } } }, // Atlas
-                        { speaker: 'Jane', voiceConfig: { prebuiltVoiceConfig: { voiceName: novaVoice } } } // Nova
+                        { speaker: 'Joe', voiceConfig: { prebuiltVoiceConfig: { voiceName: atlasVoice } } }, 
+                        { speaker: 'Jane', voiceConfig: { prebuiltVoiceConfig: { voiceName: novaVoice } } } 
                     ]
                 }
             }
@@ -219,14 +251,12 @@ export const synthesizeDialogueAudio = async (
 
     const [audioResp, imageResp] = await Promise.all([ttsPromise, imagePromise]);
 
-    // 3. Process Audio
     const base64Audio = audioResp.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     if (!base64Audio) throw new Error("Failed to synthesize audio.");
 
     const pcmBytes = base64ToUint8Array(base64Audio);
     const audioUrl = createWavUrl(pcmBytes, 24000);
 
-    // 4. Process Image
     let coverUrl = "";
     const imagePart = imageResp.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
     if (imagePart && imagePart.inlineData) {
@@ -242,36 +272,37 @@ export const generateAudioOverviewDialogue = async (
   topic: string, 
   durationHint: "short" | "medium" | "long",
   style: string = "Deep Dive",
-  onProgress?: (step: string) => void
+  onProgress?: (step: string) => void,
+  learningStyle?: string
 ): Promise<AudioOverviewDialogue> => {
   
-  if (!notebook.sources || notebook.sources.length === 0) {
-    throw new Error("No sources available in notebook.");
-  }
+  const packedSources = packSources(notebook.sources || []);
 
-  const packedSources = packSources(notebook.sources);
+  onProgress?.(`Producer generating ${style} beat sheet...`);
+  const blueprint = await generateBlueprint(topic, packedSources, style, learningStyle);
 
-  // 1. Blueprint
-  onProgress?.(`Designing ${style} blueprint...`);
-  const blueprint = await generateBlueprint(topic, packedSources, style);
+  onProgress?.("Hosts recording conversation...");
+  const scriptRaw = await generateDialogueScript(topic, blueprint, packedSources, durationHint, style, learningStyle);
 
-  // 2. Dialogue
-  onProgress?.("Writing script & performing simulation...");
-  const scriptRaw = await generateDialogueScript(topic, blueprint, packedSources, durationHint, style);
-
-  // 3. Validation
-  onProgress?.("Validating citations and evidence...");
+  onProgress?.("Finalizing mix...");
   
-  const validatedTurns = scriptRaw.turns.map((turn: any) => {
+  const validatedTurns = (scriptRaw.turns || []).map((turn: any) => {
+    const speakerName = turn.speaker === 'HOST_A' ? 'Nova' : turn.speaker === 'HOST_B' ? 'Atlas' : turn.speaker;
+    
     const validCitations = (turn.citations || []).filter((c: any) => 
-      notebook.sources.find(s => s.id === c.sourceId)
+      (notebook.sources || []).find(s => s.id === c.sourceId)
     );
-    return { ...turn, citations: validCitations };
-  });
+    
+    let pauseMs = 300; 
+    if (turn.text.includes('[PAUSE:short]')) pauseMs = 500;
+    if (turn.text.includes('[PAUSE:long]')) pauseMs = 800;
 
-  const validatedFactChecks = (scriptRaw.factChecks || []).filter((fc: any) => {
-    const source = notebook.sources.find(s => s.id === fc.sourceId);
-    return !!source; 
+    return { 
+        ...turn, 
+        speaker: speakerName,
+        pauseMsAfter: pauseMs,
+        citations: validCitations 
+    };
   });
 
   const dialogue: AudioOverviewDialogue = {
@@ -286,14 +317,13 @@ export const generateAudioOverviewDialogue = async (
     },
     coldOpen: scriptRaw.coldOpen || "Let's dive in.",
     turns: validatedTurns,
-    factChecks: validatedFactChecks,
+    factChecks: [],
     warnings: validatedTurns.length < 5 ? ["Script generation resulted in very few turns."] : []
   };
 
   return dialogue;
 };
 
-// --- JOB COMPATIBLE GENERATOR ---
 export const generateAudioOverview = async (
   sources: Source[],
   duration: "short" | "medium" | "long" = "medium",
@@ -303,7 +333,6 @@ export const generateAudioOverview = async (
   learningIntent?: string
 ): Promise<AudioOverviewDialogue> => {
   const topic = sources.length > 0 ? sources[0].title : "General Overview";
-  // Create a minimal notebook object to satisfy the interface
   const tempNotebook: Notebook = {
       id: "temp",
       title: "Temp",
@@ -314,7 +343,7 @@ export const generateAudioOverview = async (
       updatedAt: Date.now()
   };
   
-  const dialogue = await generateAudioOverviewDialogue(tempNotebook, topic, duration, style, onProgress);
+  const dialogue = await generateAudioOverviewDialogue(tempNotebook, topic, duration, style, onProgress, learningIntent);
   
   if (voices) {
       (dialogue as any).voiceConfig = voices;

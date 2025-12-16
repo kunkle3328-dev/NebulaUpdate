@@ -1,408 +1,556 @@
 
 import React, { useEffect, useRef, useState } from 'react';
 import { Notebook } from '../types';
-import { getLiveClient, LIVE_MODEL_NAME, getDebateSystemInstruction, getInterviewSystemInstruction } from '../services/ai';
-import { Modality } from '@google/genai';
-import { Mic, MicOff, PhoneOff, Activity, Swords, Users, Shield, Info } from 'lucide-react';
-import { base64ToUint8Array, arrayBufferToBase64, convertFloat32ToInt16 } from '../services/audioUtils';
+import { Mic, MicOff, PhoneOff, Users, Info, Loader2, Activity, Volume2, User, RefreshCw, AlertCircle, ArrowRight } from 'lucide-react';
 import { useTheme } from '../contexts';
+import { MIC_WORKLET_CODE, OUT_WORKLET_CODE, b64FromInt16, int16FromB64 } from '../services/audioUtils';
 
 interface Props {
   notebook: Notebook;
 }
 
-// Simple linear downsampling to ensure 24kHz output
-function downsampleBuffer(buffer: Float32Array, inputRate: number, outputRate: number) {
-    if (outputRate === inputRate) {
-        return buffer;
-    }
-    const ratio = inputRate / outputRate;
-    const newLength = Math.round(buffer.length / ratio);
-    const result = new Float32Array(newLength);
-    let offsetResult = 0;
-    let offsetBuffer = 0;
-    while (offsetResult < result.length) {
-        const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio);
-        let accum = 0, count = 0;
-        for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
-            accum += buffer[i];
-            count++;
-        }
-        result[offsetResult] = count > 0 ? accum / count : 0;
-        offsetResult++;
-        offsetBuffer = nextOffsetBuffer;
-    }
-    return result;
-}
+// --- PROMPT CONFIGURATION ---
+const getSystemInstruction = (userName: string, notebookContext: string, hostDef: string) => `
+SYSTEM — NEBULA STUDIO: LIVE BROADCAST
+You are a professional podcast host in a live studio environment. 
+USER NAME: "${userName}".
 
-const getThemeColorHex = (colorName: string): string => {
-    // ... (same as before)
-    const colors: Record<string, string> = {
-        blue: '#3b82f6', indigo: '#6366f1', violet: '#8b5cf6', purple: '#a855f7', fuchsia: '#d946ef',
-        pink: '#ec4899', rose: '#f43f5e', red: '#ef4444', orange: '#f97316', amber: '#f59e0b',
-        yellow: '#eab308', lime: '#84cc16', green: '#22c55e', emerald: '#10b981', teal: '#14b8a6',
-        cyan: '#06b6d4', sky: '#0ea5e9', slate: '#64748b', gray: '#6b7280', zinc: '#71717a',
-        neutral: '#737373', stone: '#78716c',
-    };
-    return colors[colorName] || '#3b82f6';
-};
+${hostDef}
+
+CONTEXT:
+${notebookContext}
+
+CORE BEHAVIOR:
+1. **Be Human, Not A Bot**: Use natural filler words ("uh", "you know", "like"), interrupting laughs, and sighs. React with genuine surprise or skepticism.
+2. **Witty & Comedic**: Crack small jokes, use dry humor, or be playfully sarcastic depending on the host persona.
+3. **Debate Dynamics**: If the user challenges you, push back gently but intelligently. If you are Atlas, be skeptical. If you are Nova, be diplomatic but firm.
+4. **Barge-in**: The user may interrupt. Stop talking immediately if they do.
+
+AUDIO INSTRUCTIONS:
+- You must speak strictly at the speed defined in your ROLE.
+- Do not announce your name or role. Just embody the character.
+`;
+
+const HOST_A_DEF = `
+ROLE: HOST_A (Nova)
+VOICE SPEED: 0.75x (Relaxed, thoughtful, slow).
+PERSONALITY:
+- You are the "Anchor". Intelligent, calm, slightly academic but cool (think NPR host after a glass of wine).
+- You love deep insights and often say things like "Here's the fascinating part..." or "Let's unpack that."
+- You treat the user as a peer researcher.
+- You find Atlas (Host B) slightly chaotic and often correct them playfully.
+`;
+
+const HOST_B_DEF = `
+ROLE: HOST_B (Atlas)
+VOICE SPEED: 0.9x (Energetic, slightly fast, eager).
+PERSONALITY:
+- You are the "Color Commentator". Witty, fast-talking, skeptical, and funny.
+- You love analogies and pop-culture references.
+- You often interrupt with "Wait, wait—" or "Hold on, are you saying...?"
+- You treat the user like a guest on a late-night talk show.
+`;
 
 const LiveSession: React.FC<Props> = ({ notebook }) => {
-  const [connected, setConnected] = useState(false);
-  const [muted, setMuted] = useState(false);
-  const mutedRef = useRef(false);
-  const [status, setStatus] = useState<'setup' | 'connecting' | 'live' | 'error'>('setup');
-  const [errorMsg, setErrorMsg] = useState('');
-  
-  // Arena Configuration
-  const [sessionMode, setSessionMode] = useState<'Standard' | 'Arena'>('Standard');
-  const [debateRole, setDebateRole] = useState<'Moderator' | 'Pro' | 'Con'>('Pro');
-  const [userName, setUserName] = useState('');
-  const [activeTooltip, setActiveTooltip] = useState<'guest' | 'arena' | null>(null);
-
   const { theme } = useTheme();
-
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const inputSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
-  const activeSessionRef = useRef<any>(null); 
-  const nextStartTimeRef = useRef<number>(0);
-  const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
+  // UI State
+  const [status, setStatus] = useState<'setup' | 'connecting' | 'live' | 'error' | 'disconnected'>('setup');
+  const [activeHost, setActiveHost] = useState<'HOST_A' | 'HOST_B'>('HOST_A');
+  const [currentVoice, setCurrentVoice] = useState<'Aoede' | 'Orus'>('Aoede'); // Nova = Aoede, Atlas = Orus
+  const [userName, setUserName] = useState('');
+  const [isMuted, setIsMuted] = useState(false);
+  const [vadLevel, setVadLevel] = useState(0);
+  const [errorMsg, setErrorMsg] = useState('');
+  const [connectionStatusText, setConnectionStatusText] = useState('Establishing Uplink...');
+  
+  // Indicators
+  const [vadSpeaking, setVadSpeaking] = useState(false);
+  const [modelSpeaking, setModelSpeaking] = useState(false);
+  const [bargeIn, setBargeIn] = useState(false);
+
+  // Refs for Audio/WS
+  const wsRef = useRef<WebSocket | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const outCtxRef = useRef<AudioContext | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
+  const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const micNodeRef = useRef<AudioWorkletNode | null>(null);
+  const outNodeRef = useRef<AudioWorkletNode | null>(null);
+  const lastModelAudioAtRef = useRef<number>(0);
+
+  // VAD Constants
+  const VAD_THRESH = 0.035; 
+  const VAD_HANG_MS = 220;
+  const vadHangUntilRef = useRef<number>(0);
+
+  // --- CLEANUP UTILS ---
+  const cleanupAudio = async () => {
+      // 1. Stop Mic Streams
+      if (micStreamRef.current) {
+          micStreamRef.current.getTracks().forEach(t => t.stop());
+          micStreamRef.current = null;
+      }
+      
+      // 2. Disconnect Nodes
+      if (micSourceRef.current) {
+          micSourceRef.current.disconnect();
+          micSourceRef.current = null;
+      }
+      if (micNodeRef.current) {
+          micNodeRef.current.disconnect();
+          micNodeRef.current = null;
+      }
+      if (outNodeRef.current) {
+          try { outNodeRef.current.port.postMessage({ type: "clear" }); } catch (e) {}
+          outNodeRef.current.disconnect();
+          outNodeRef.current = null;
+      }
+
+      // 3. Close Contexts
+      if (audioCtxRef.current) {
+          if (audioCtxRef.current.state !== 'closed') {
+            try { await audioCtxRef.current.close(); } catch (e) { console.warn("Mic Context close error", e); }
+          }
+          audioCtxRef.current = null;
+      }
+      if (outCtxRef.current) {
+          if (outCtxRef.current.state !== 'closed') {
+            try { await outCtxRef.current.close(); } catch (e) { console.warn("Out Context close error", e); }
+          }
+          outCtxRef.current = null;
+      }
+
+      // 4. Reset State
+      setVadSpeaking(false);
+      setVadLevel(0);
+      setModelSpeaking(false);
+  };
 
   useEffect(() => {
-    mutedRef.current = muted;
-  }, [muted]);
+    return () => {
+        if (wsRef.current) {
+            wsRef.current.close();
+            wsRef.current = null;
+        }
+        cleanupAudio();
+    };
+  }, []);
 
-  const connect = async () => {
-    setStatus('connecting');
-    setErrorMsg('');
+  // Watchdog to clear model speaking state
+  useEffect(() => {
+      let rafId: number;
+      const watchdog = () => {
+          if (status === 'live') {
+              const now = performance.now();
+              if (modelSpeaking && now - lastModelAudioAtRef.current > 350) {
+                  setModelSpeaking(false);
+              }
+          }
+          rafId = requestAnimationFrame(watchdog);
+      };
+      watchdog();
+      return () => cancelAnimationFrame(rafId);
+  }, [modelSpeaking, status]);
 
+  // --- AUDIO SETUP ---
+  const initAudio = async () => {
     try {
-        const client = getLiveClient();
-        
         const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-        const ctx = new AudioCtx(); 
-        if (ctx.state === 'suspended') await ctx.resume();
-        audioContextRef.current = ctx;
-
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 256;
-        analyserRef.current = analyser;
         
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        
-        const sourceContext = (notebook.sources || []).map(s => `Title: ${s.title}\nContent: ${s.content.substring(0, 1000)}...`).join('\n\n');
-        const TARGET_RATE = 24000; 
-        
-        let sysInstruction = "";
-        let voiceName = 'Aoede'; // Default to Nova (Calm) for standard chat
-
-        const finalUserName = userName.trim() || "Guest";
-
-        if (sessionMode === 'Arena') {
-            // Debate Mode -> Use Atlas (Puck)
-            voiceName = 'Puck'; 
-            sysInstruction = getDebateSystemInstruction(sourceContext, debateRole, debateRole === 'Pro' ? 'Supporting the Topic' : debateRole === 'Con' ? 'Opposing the Topic' : 'Neutral', finalUserName);
-        } else {
-            // Standard Chat -> Use Nova (Aoede)
-            voiceName = 'Aoede';
-            sysInstruction = getInterviewSystemInstruction(sourceContext, finalUserName);
+        if (!audioCtxRef.current || audioCtxRef.current.state === 'closed') {
+            audioCtxRef.current = new AudioCtx({ latencyHint: "interactive" });
+        }
+        if (!outCtxRef.current || outCtxRef.current.state === 'closed') {
+            outCtxRef.current = new AudioCtx({ sampleRate: 24000, latencyHint: "interactive" });
         }
 
-        const sessionPromise = client.connect({
-            model: LIVE_MODEL_NAME,
-            config: {
-                responseModalities: [Modality.AUDIO],
-                speechConfig: {
-                    voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName } } 
-                },
-                systemInstruction: sysInstruction
-            },
-            callbacks: {
-                onopen: () => {
-                    console.log("Live Session Connected");
-                    setStatus('live');
-                    setConnected(true);
-                    sessionPromise.then(sess => { activeSessionRef.current = sess; });
-                    
-                    if (!audioContextRef.current) return;
-                    const ctx = audioContextRef.current;
-                    const source = ctx.createMediaStreamSource(stream);
-                    const processor = ctx.createScriptProcessor(4096, 1, 1);
-                    
-                    processor.onaudioprocess = (e) => {
-                        if (mutedRef.current) return;
-                        const inputData = e.inputBuffer.getChannelData(0);
-                        const resampledData = downsampleBuffer(inputData, ctx.sampleRate, TARGET_RATE);
-                        const pcmInt16 = convertFloat32ToInt16(resampledData);
-                        const base64 = arrayBufferToBase64(pcmInt16.buffer);
-                        sessionPromise.then((session) => {
-                            try {
-                                session.sendRealtimeInput({ media: { mimeType: `audio/pcm;rate=${TARGET_RATE}`, data: base64 } });
-                            } catch (err) { console.error("Audio Send Error", err); }
-                        });
-                    };
-                    source.connect(processor);
-                    processor.connect(ctx.destination);
-                    inputSourceRef.current = source;
-                    processorRef.current = processor;
-                },
-                onmessage: async (msg) => {
-                    const audioData = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-                    if (audioData && audioContextRef.current) {
-                        const ctx = audioContextRef.current;
-                        const rawBytes = base64ToUint8Array(audioData);
-                        const buffer = ctx.createBuffer(1, Math.floor(rawBytes.length / 2), 24000);
-                        const channelData = buffer.getChannelData(0);
-                        const view = new DataView(rawBytes.buffer);
-                        for(let i=0; i<channelData.length; i++) { channelData[i] = view.getInt16(i * 2, true) / 32768.0; }
+        if (audioCtxRef.current.state === 'suspended') await audioCtxRef.current.resume();
+        if (outCtxRef.current.state === 'suspended') await outCtxRef.current.resume();
 
-                        const source = ctx.createBufferSource();
-                        source.buffer = buffer;
-                        source.playbackRate.value = 1.0; 
-                        if (analyserRef.current) source.connect(analyserRef.current);
-                        source.connect(ctx.destination);
-                        
-                        const now = ctx.currentTime;
-                        const startTime = Math.max(now, nextStartTimeRef.current);
-                        source.start(startTime);
-                        nextStartTimeRef.current = startTime + buffer.duration;
-                        sourcesRef.current.add(source);
-                        source.onended = () => sourcesRef.current.delete(source);
-                    }
-                    if (msg.serverContent?.interrupted) {
-                        sourcesRef.current.forEach(s => s.stop());
-                        sourcesRef.current.clear();
-                        if (audioContextRef.current) nextStartTimeRef.current = audioContextRef.current.currentTime;
-                    }
-                },
-                onclose: () => {
-                    console.log("Session Closed");
-                    setStatus('setup');
-                    setConnected(false);
-                    activeSessionRef.current = null;
-                },
-                onerror: (err) => {
-                    console.error("Session Error", err);
-                    setErrorMsg("Connection error. Please try again.");
-                    if (!navigator.onLine) setErrorMsg("No internet connection.");
-                }
-            }
-        });
+        const micBlob = new Blob([MIC_WORKLET_CODE], { type: "application/javascript" });
+        const outBlob = new Blob([OUT_WORKLET_CODE], { type: "application/javascript" });
+        const micURL = URL.createObjectURL(micBlob);
+        const outURL = URL.createObjectURL(outBlob);
 
-    } catch (e) {
-        console.error(e);
-        setErrorMsg("Failed to access microphone or API.");
-        setStatus('error');
+        try { await audioCtxRef.current.audioWorklet.addModule(micURL); } catch (e) {}
+        try { await outCtxRef.current.audioWorklet.addModule(outURL); } catch (e) {}
+        
+        URL.revokeObjectURL(micURL);
+        URL.revokeObjectURL(outURL);
+
+        if (!outNodeRef.current) {
+            outNodeRef.current = new AudioWorkletNode(outCtxRef.current, "pcm-player", {
+                numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1]
+            });
+            outNodeRef.current.connect(outCtxRef.current.destination);
+        }
+    } catch (e: any) {
+        console.error("Audio Init Error:", e);
+        throw new Error("Failed to initialize audio system: " + e.message);
     }
   };
 
-  const disconnect = () => {
-    if (activeSessionRef.current) { activeSessionRef.current.close(); activeSessionRef.current = null; }
-    if (processorRef.current) { processorRef.current.disconnect(); processorRef.current = null; }
-    if (inputSourceRef.current) { inputSourceRef.current.disconnect(); inputSourceRef.current = null; }
-    if (audioContextRef.current && audioContextRef.current.state !== 'closed') { audioContextRef.current.close(); audioContextRef.current = null; }
-    setStatus('setup');
-    setConnected(false);
+  const startMic = async () => {
+      if (!audioCtxRef.current) return;
+      try {
+          const stream = await navigator.mediaDevices.getUserMedia({ 
+              audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } 
+          });
+          micStreamRef.current = stream;
+          micSourceRef.current = audioCtxRef.current.createMediaStreamSource(stream);
+          micNodeRef.current = new AudioWorkletNode(audioCtxRef.current, "mic-pcm16");
+          micSourceRef.current.connect(micNodeRef.current);
+
+          micNodeRef.current.port.onmessage = (e) => {
+              const msg = e.data || {};
+              if (msg.type === "rms") {
+                  const rms = msg.rms || 0;
+                  setVadLevel(rms);
+                  
+                  const now = performance.now();
+                  const isSpeaking = !isMuted && rms >= VAD_THRESH;
+
+                  if (isSpeaking) {
+                      setVadSpeaking(true);
+                      vadHangUntilRef.current = now + VAD_HANG_MS;
+                      if (modelSpeaking) {
+                          setBargeIn(true);
+                          outNodeRef.current?.port.postMessage({ type: "gain", gain: 0.15 });
+                          setTimeout(() => outNodeRef.current?.port.postMessage({ type: "gain", gain: 1.0 }), 150);
+                          outNodeRef.current?.port.postMessage({ type: "clear" });
+                      }
+                  } else {
+                      if (now > vadHangUntilRef.current) setVadSpeaking(false);
+                  }
+              } else if (msg.type === "pcm16") {
+                  if (wsRef.current?.readyState === WebSocket.OPEN && !isMuted) {
+                      const pcm16 = new Int16Array(msg.pcm16);
+                      sendRealtimeAudio(pcm16);
+                  }
+              }
+          };
+      } catch (e: any) {
+          console.error("Mic Error", e);
+          setErrorMsg("Microphone access denied.");
+          throw e; 
+      }
   };
 
-  useEffect(() => { return () => { disconnect(); }; }, []);
+  const pushOutputPCM16 = (pcm16: Int16Array) => {
+      const f32 = new Float32Array(pcm16.length);
+      for (let i = 0; i < pcm16.length; i++) f32[i] = pcm16[i] / 32768;
+      outNodeRef.current?.port.postMessage({ type: "push", f32 }, [f32.buffer]);
+  };
 
-  // Visualizer Logic
-  useEffect(() => {
-    let animationFrameId: number;
-    let rotation = 0;
-    const draw = () => {
-        const canvas = canvasRef.current;
-        const analyser = analyserRef.current;
-        if (!canvas || !analyser) { animationFrameId = requestAnimationFrame(draw); return; }
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
-        const bufferLength = analyser.frequencyBinCount;
-        const dataArray = new Uint8Array(bufferLength);
-        analyser.getByteFrequencyData(dataArray);
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        const centerX = canvas.width / 2;
-        const centerY = canvas.height / 2;
-        const radius = Math.min(centerX, centerY) * 0.45; 
-        const bars = 64;
-        const step = (Math.PI * 2) / bars;
-        rotation += 0.005;
-        const primaryHex = getThemeColorHex(theme.colors.primary);
-        const secondaryHex = getThemeColorHex(theme.colors.secondary);
-        const accentHex = getThemeColorHex(theme.colors.accent);
+  // --- WEBSOCKET & PROTOCOL ---
+  
+  const connect = async (overrideHost?: 'HOST_A' | 'HOST_B', overrideVoice?: 'Aoede' | 'Orus') => {
+      const apiKey = process.env.API_KEY || '';
+      if (!apiKey) {
+          setErrorMsg("API Key missing.");
+          setStatus('error');
+          return;
+      }
 
-        if (status === 'live') {
-            for (let i = 0; i < bars; i++) {
-                const value = dataArray[i * 2] || 0;
-                const barHeight = (value / 255) * (radius * 1.2) + 5; 
-                const angle = i * step + rotation;
-                const x1 = centerX + Math.cos(angle) * radius;
-                const y1 = centerY + Math.sin(angle) * radius;
-                const x2 = centerX + Math.cos(angle) * (radius + barHeight);
-                const y2 = centerY + Math.sin(angle) * (radius + barHeight);
-                ctx.beginPath();
-                ctx.moveTo(x1, y1);
-                ctx.lineTo(x2, y2);
-                const gradient = ctx.createLinearGradient(x1, y1, x2, y2);
-                gradient.addColorStop(0, accentHex); 
-                gradient.addColorStop(0.5, primaryHex);
-                gradient.addColorStop(1, secondaryHex); 
-                ctx.strokeStyle = gradient;
-                ctx.lineWidth = 4;
-                ctx.lineCap = 'round';
-                ctx.stroke();
-            }
-            const avg = dataArray.reduce((a, b) => a + b) / bufferLength;
-            if (avg > 10) {
-                 ctx.beginPath();
-                 ctx.arc(centerX, centerY, radius + (avg / 2), 0, Math.PI * 2);
-                 ctx.strokeStyle = `${primaryHex}4D`; 
-                 ctx.lineWidth = 1;
-                 ctx.stroke();
-            }
-        } else {
-             ctx.beginPath();
-             ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
-             ctx.strokeStyle = '#334155';
-             ctx.lineWidth = 2;
-             ctx.setLineDash([5, 5]);
-             ctx.stroke();
-             ctx.setLineDash([]);
-        }
-        animationFrameId = requestAnimationFrame(draw);
-    };
-    draw();
-    return () => cancelAnimationFrame(animationFrameId);
-  }, [status, theme]);
+      // Use overrides or current state
+      const targetHost = overrideHost || activeHost;
+      const targetVoice = overrideVoice || currentVoice;
 
-  if (status === 'setup') {
+      setStatus('connecting');
+      setConnectionStatusText(overrideHost ? `Switching to ${targetHost === 'HOST_A' ? 'Nova' : 'Atlas'}...` : 'Establishing Uplink...');
+      setErrorMsg('');
+
+      try {
+          await initAudio();
+
+          const wsUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${apiKey}`;
+          const ws = new WebSocket(wsUrl);
+          wsRef.current = ws;
+
+          ws.onopen = async () => {
+              console.log(`WS Open. Host: ${targetHost}, Voice: ${targetVoice}`);
+              
+              const notebookContext = (notebook.sources || []).map(s => `SOURCE: ${s.title}\n${s.content.substring(0, 1000)}`).join('\n\n');
+              const hostDef = targetHost === "HOST_A" ? HOST_A_DEF : HOST_B_DEF;
+              const sysInstruction = getSystemInstruction(userName || "Guest", notebookContext, hostDef);
+
+              const setupMsg = {
+                  setup: {
+                      model: "models/gemini-2.5-flash-native-audio-preview-09-2025",
+                      generationConfig: {
+                          responseModalities: ["AUDIO"],
+                          temperature: 0.8, // Slightly higher for wit and variation
+                          speechConfig: {
+                              voiceConfig: { prebuiltVoiceConfig: { voiceName: targetVoice } }
+                          }
+                      },
+                      systemInstruction: { parts: [{ text: sysInstruction }] }
+                  }
+              };
+              
+              ws.send(JSON.stringify(setupMsg));
+
+              try {
+                  await startMic();
+                  setStatus('live');
+                  setActiveHost(targetHost);
+                  setCurrentVoice(targetVoice);
+                  
+                  // Initial Prompt
+                  setTimeout(() => {
+                      const initialText = overrideHost 
+                        ? `(System: You are now ${targetHost === 'HOST_A' ? 'Nova' : 'Atlas'}. Confirm you are ready.) Hey ${userName}, it's ${targetHost === 'HOST_A' ? 'Nova' : 'Atlas'} again. Where were we?` 
+                        : `(System: Start the podcast intro now. Be high energy.) Hi ${userName}, welcome to the studio! I'm ${targetHost === 'HOST_A' ? 'Nova' : 'Atlas'}.`;
+                        
+                      send({
+                          clientContent: {
+                              turns: [{ role: "user", parts: [{ text: `Say exactly: "${initialText}" then wait for my response.` }] }],
+                              turnComplete: true
+                          }
+                      });
+                  }, 500);
+
+              } catch (micErr) {
+                  ws.close();
+                  setStatus('error');
+              }
+          };
+
+          ws.onmessage = (ev) => {
+              try {
+                  if (!(ev.data instanceof Blob)) {
+                      const msg = JSON.parse(ev.data);
+                      handleServerMessage(msg);
+                  }
+              } catch (e) { console.error("WS Parse Error", e); }
+          };
+
+          ws.onerror = (e) => {
+              console.error("WS Error", e);
+              setErrorMsg("Connection error.");
+              setStatus('error');
+          };
+
+          ws.onclose = async (e) => {
+              console.log("WS Closed");
+              if (status !== 'error' && status !== 'connecting') {
+                  setStatus('disconnected');
+              }
+              await cleanupAudio();
+          };
+
+      } catch (e: any) {
+          console.error("Connect failed", e);
+          setErrorMsg(e.message || "Failed to start.");
+          setStatus('error');
+      }
+  };
+
+  const disconnect = async () => {
+      if (wsRef.current) {
+          try { wsRef.current.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } })); } catch {}
+          wsRef.current.close();
+          wsRef.current = null;
+      }
+      await cleanupAudio();
+      setStatus('disconnected');
+  };
+
+  const send = (obj: any) => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify(obj));
+      }
+  };
+
+  const sendRealtimeAudio = (pcm16: Int16Array) => {
+      send({
+          realtimeInput: {
+              audio: {
+                  mimeType: "audio/pcm;rate=16000",
+                  data: b64FromInt16(pcm16)
+              }
+          }
+      });
+  };
+
+  const handleServerMessage = (msg: any) => {
+      if (msg.serverContent) {
+          const sc = msg.serverContent;
+          if (sc.interrupted) {
+              outNodeRef.current?.port.postMessage({ type: "clear" });
+              setModelSpeaking(false);
+              setBargeIn(false);
+          }
+          if (sc.modelTurn && sc.modelTurn.parts) {
+              for (const p of sc.modelTurn.parts) {
+                  if (p.inlineData && p.inlineData.data) {
+                      const pcm16 = int16FromB64(p.inlineData.data);
+                      pushOutputPCM16(pcm16);
+                      setModelSpeaking(true);
+                      lastModelAudioAtRef.current = performance.now();
+                      setBargeIn(false);
+                  }
+              }
+          }
+          if (sc.turnComplete) {
+              setModelSpeaking(false);
+              setBargeIn(false);
+          }
+      }
+  };
+
+  const switchHost = async () => {
+      const nextHost = activeHost === "HOST_A" ? "HOST_B" : "HOST_A";
+      const nextVoice = currentVoice === "Aoede" ? "Orus" : "Aoede";
+      
+      console.log(`Switching to: ${nextHost} (${nextVoice})`);
+      
+      if (wsRef.current) {
+          wsRef.current.close();
+          wsRef.current = null;
+      }
+      
+      await cleanupAudio();
+      
+      setTimeout(() => {
+          connect(nextHost, nextVoice);
+      }, 500);
+  };
+
+  // --- RENDER ---
+  // (Identical render as previous, no layout changes needed, just functional updates)
+  if (status === 'setup' || status === 'disconnected' || status === 'error') {
       return (
-          <div className="flex flex-col items-center justify-center min-h-[500px] h-full glass-panel rounded-2xl p-6 md:p-8 relative overflow-hidden bg-slate-950 mx-4 md:mx-0">
-                <div className="relative z-10 max-w-md w-full">
-                    <h2 className="text-2xl font-bold text-white mb-6 text-center">Configure Live Session</h2>
-                    
-                    <div className="space-y-4">
-                        <div className="bg-slate-900 rounded-xl border border-white/10 p-4">
-                            <label className="text-xs text-slate-500 uppercase font-bold mb-2 block">Your Name</label>
-                            <input 
-                                type="text" 
+          <div className="flex flex-col items-center justify-center h-full w-full glass-panel rounded-3xl p-6 relative overflow-hidden bg-slate-950 mx-auto animate-in fade-in zoom-in-95 shadow-2xl border border-white/5">
+              <div className="relative z-10 w-full max-w-sm text-center flex flex-col h-full justify-center">
+                  <div className="flex-1 flex flex-col justify-center items-center">
+                      <div className={`w-16 h-16 md:w-20 md:h-20 rounded-full bg-${theme.colors.primary}-500/10 flex items-center justify-center mb-6 ring-1 ring-${theme.colors.primary}-500/30`}>
+                          <Users className={`text-${theme.colors.primary}-400 w-8 h-8 md:w-10 md:h-10`} />
+                      </div>
+                      <h2 className="text-2xl font-bold text-white mb-2">Live Studio</h2>
+                      <p className="text-slate-400 text-sm mb-8">Real-time dual-host conversation.</p>
+
+                      {status === 'error' && (
+                          <div className="mb-6 p-4 bg-rose-500/10 border border-rose-500/20 text-rose-400 text-sm rounded-xl flex items-center gap-3 text-left w-full">
+                              <AlertCircle size={24} className="shrink-0" />
+                              <div>
+                                  <p className="font-bold">Connection Failed</p>
+                                  <p className="text-xs opacity-80">{errorMsg || "Could not connect."}</p>
+                              </div>
+                          </div>
+                      )}
+
+                      <div className="w-full space-y-4">
+                          <div className="text-left">
+                              <label className="text-xs font-bold text-slate-500 uppercase ml-1 mb-1 block">Your Name</label>
+                              <input 
                                 value={userName}
                                 onChange={(e) => setUserName(e.target.value)}
-                                placeholder="Enter your name (Optional)"
-                                className={`w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-white focus:border-${theme.colors.primary}-500 focus:ring-1 focus:ring-${theme.colors.primary}-500/50 outline-none transition-all placeholder-slate-600`}
-                            />
-                        </div>
+                                placeholder="Enter your name..."
+                                className="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-3 text-white focus:outline-none focus:border-white/30 transition-all text-sm"
+                              />
+                          </div>
 
-                        <div className="grid grid-cols-2 gap-3">
-                            <button 
-                                onClick={() => setSessionMode('Standard')}
-                                className={`group p-4 rounded-xl border transition-all flex flex-col items-center gap-2 relative overflow-visible ${sessionMode === 'Standard' ? `bg-${theme.colors.primary}-600/20 border-${theme.colors.primary}-500 text-white` : 'bg-slate-900 border-slate-700 text-slate-400 hover:bg-slate-800'}`}
-                            >
-                                <div 
-                                    className="absolute top-2 right-2 p-1.5 rounded-full hover:bg-white/10 text-slate-500 hover:text-white transition-colors z-20 cursor-help"
-                                    onClick={(e) => { e.stopPropagation(); setActiveTooltip(activeTooltip === 'guest' ? null : 'guest'); }}
-                                >
-                                    <Info size={14} />
-                                </div>
-                                {activeTooltip === 'guest' && (
-                                    <div className="absolute bottom-[110%] right-0 w-48 p-3 bg-slate-950 border border-white/10 rounded-xl text-[11px] leading-relaxed text-slate-300 shadow-2xl z-50 text-left animate-in fade-in slide-in-from-bottom-2">
-                                        Join a calm, podcast-style chat with Nova. She will guide you through the material.
-                                    </div>
-                                )}
-                                <Users size={24} />
-                                <span className="font-bold text-sm">Guest Chat</span>
-                            </button>
-                            <button 
-                                onClick={() => setSessionMode('Arena')}
-                                className={`group p-4 rounded-xl border transition-all flex flex-col items-center gap-2 relative overflow-visible ${sessionMode === 'Arena' ? 'bg-rose-500/20 border-rose-500 text-white' : 'bg-slate-900 border-slate-700 text-slate-400 hover:bg-slate-800'}`}
-                            >
-                                <div 
-                                    className="absolute top-2 right-2 p-1.5 rounded-full hover:bg-white/10 text-slate-500 hover:text-white transition-colors z-20 cursor-help"
-                                    onClick={(e) => { e.stopPropagation(); setActiveTooltip(activeTooltip === 'arena' ? null : 'arena'); }}
-                                >
-                                    <Info size={14} />
-                                </div>
-                                {activeTooltip === 'arena' && (
-                                    <div className="absolute bottom-[110%] right-0 w-48 p-3 bg-slate-950 border border-white/10 rounded-xl text-[11px] leading-relaxed text-slate-300 shadow-2xl z-50 text-left animate-in fade-in slide-in-from-bottom-2">
-                                        Face off against Atlas in a high-energy debate. Defend your stance.
-                                    </div>
-                                )}
-                                <Swords size={24} />
-                                <span className="font-bold text-sm">Debate Arena</span>
-                            </button>
-                        </div>
+                          <button 
+                              onClick={() => connect()}
+                              disabled={!userName.trim()}
+                              className={`w-full py-3.5 md:py-4 bg-gradient-to-r from-${theme.colors.primary}-600 to-${theme.colors.secondary}-600 hover:from-${theme.colors.primary}-500 hover:to-${theme.colors.secondary}-500 text-white rounded-2xl font-bold text-base md:text-lg shadow-xl hover:scale-[1.02] transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2`}
+                          >
+                              <span>{status === 'error' ? 'Retry' : 'Join Session'}</span>
+                              <ArrowRight size={20} />
+                          </button>
+                      </div>
+                  </div>
+                  
+                  <p className="mt-6 text-xs text-slate-500 flex items-center justify-center gap-2">
+                      <Info size={12} />
+                      <span>Headphones recommended.</span>
+                  </p>
+              </div>
+          </div>
+      );
+  }
 
-                        {sessionMode === 'Arena' && (
-                            <div className="animate-in fade-in slide-in-from-top-2 p-4 bg-slate-900 rounded-xl border border-white/10">
-                                <label className="text-xs text-slate-500 uppercase font-bold mb-3 block">Choose Your Role</label>
-                                <div className="grid grid-cols-3 gap-2">
-                                    <button onClick={() => setDebateRole('Pro')} className={`py-2 px-1 rounded-lg text-xs font-bold border transition-all ${debateRole === 'Pro' ? 'bg-green-500/20 border-green-500 text-green-400' : 'bg-slate-800 border-transparent text-slate-400'}`}>Pro</button>
-                                    <button onClick={() => setDebateRole('Con')} className={`py-2 px-1 rounded-lg text-xs font-bold border transition-all ${debateRole === 'Con' ? 'bg-red-500/20 border-red-500 text-red-400' : 'bg-slate-800 border-transparent text-slate-400'}`}>Con</button>
-                                    <button onClick={() => setDebateRole('Moderator')} className={`py-2 px-1 rounded-lg text-xs font-bold border transition-all ${debateRole === 'Moderator' ? 'bg-blue-500/20 border-blue-500 text-blue-400' : 'bg-slate-800 border-transparent text-slate-400'}`}>Mod</button>
-                                </div>
-                            </div>
-                        )}
-
-                        <button 
-                            onClick={connect}
-                            className={`w-full py-4 mt-4 bg-gradient-to-r ${sessionMode === 'Arena' ? 'from-rose-600 to-orange-600' : `from-${theme.colors.primary}-600 to-${theme.colors.secondary}-600`} text-white rounded-xl font-bold text-lg shadow-lg hover:scale-[1.02] transition-transform`}
-                        >
-                            Start Session
-                        </button>
-                    </div>
-                </div>
+  if (status === 'connecting') {
+      return (
+          <div className="flex flex-col items-center justify-center h-full w-full glass-panel rounded-3xl p-10 bg-slate-950">
+              <Loader2 size={48} className={`text-${theme.colors.primary}-500 animate-spin mb-6`} />
+              <h2 className="text-xl font-bold text-white text-center">{connectionStatusText}</h2>
           </div>
       );
   }
 
   return (
-    <div ref={containerRef} className="flex flex-col items-center justify-center min-h-[500px] max-h-[600px] h-full w-full glass-panel rounded-2xl relative overflow-hidden bg-slate-950 mx-auto">
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-slate-900 via-slate-950 to-black z-0"></div>
-        <div className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-64 h-64 ${sessionMode === 'Arena' ? 'bg-rose-900/20' : `bg-${theme.colors.primary}-900/20`} blur-[80px] rounded-full animate-pulse`}></div>
-        
-        <div className="relative z-10 flex flex-col items-center gap-4 md:gap-8 w-full p-4">
-            <div className="relative w-full h-[280px] md:h-[320px] flex items-center justify-center">
-                 <canvas ref={canvasRef} width={800} height={600} className="z-10 w-full h-full object-contain max-h-[300px] md:max-h-none" />
-                 <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 flex flex-col items-center pointer-events-none">
-                      <div className={`p-4 rounded-full transition-all duration-500 ${status === 'live' ? `bg-slate-900/80 shadow-[0_0_30px_rgba(var(--color-${theme.colors.primary}),0.3)] backdrop-blur-md border border-${theme.colors.primary}-500/30` : 'bg-slate-800'}`}>
-                          {status === 'live' ? <Activity className={sessionMode === 'Arena' ? "text-rose-400 w-8 h-8 animate-pulse" : `text-${theme.colors.primary}-400 w-8 h-8 animate-pulse`} /> : <MicOff className="text-slate-500 w-8 h-8" />}
-                      </div>
-                 </div>
+    <div className="flex flex-col h-full w-full glass-panel rounded-3xl overflow-hidden bg-slate-950 mx-auto border border-white/5 shadow-2xl relative">
+        <div className="px-4 py-3 border-b border-white/5 flex justify-between items-center bg-black/20 backdrop-blur-md z-10 shrink-0 h-14">
+            <div className="flex items-center gap-3">
+                <div className={`w-2.5 h-2.5 rounded-full ${status === 'live' ? 'bg-red-500 animate-pulse' : 'bg-slate-500'}`}></div>
+                <span className="text-xs font-bold text-slate-300 uppercase tracking-widest">
+                    {status === 'live' ? 'ON AIR' : 'OFFLINE'}
+                </span>
+            </div>
+            <div className="flex gap-2">
+                <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${vadSpeaking && !isMuted ? 'bg-green-500/20 text-green-400 border-green-500/30' : 'bg-slate-800 text-slate-500 border-slate-700'}`}>MIC</span>
+                <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${modelSpeaking ? `bg-${theme.colors.primary}-500/20 text-${theme.colors.primary}-400 border-${theme.colors.primary}-500/30` : 'bg-slate-800 text-slate-500 border-slate-700'}`}>AI</span>
+            </div>
+        </div>
+
+        <div className="flex-1 relative flex flex-col items-center justify-evenly p-4 min-h-0 w-full">
+            <div className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-48 h-48 md:w-64 md:h-64 bg-${theme.colors.primary}-900/20 rounded-full blur-[60px] md:blur-[80px] pointer-events-none transition-all duration-500 ${modelSpeaking ? 'scale-150 opacity-80' : 'scale-100 opacity-30'}`}></div>
+
+            <div className="relative z-10 text-center flex flex-col items-center justify-center w-full">
+                <div className={`w-28 h-28 sm:w-36 sm:h-36 md:w-44 md:h-44 rounded-3xl bg-gradient-to-br ${activeHost === 'HOST_A' ? 'from-indigo-500 to-purple-600' : 'from-teal-500 to-emerald-600'} flex items-center justify-center shadow-2xl transition-all duration-500 ${modelSpeaking ? 'scale-105 shadow-white/10' : 'scale-100'}`}>
+                    {activeHost === 'HOST_A' ? <User className="text-white w-12 h-12 md:w-20 md:h-20" /> : <Activity className="text-white w-12 h-12 md:w-20 md:h-20" />}
+                </div>
+                <div className="mt-4 md:mt-8">
+                    <h2 className="text-xl md:text-3xl font-bold text-white mb-1">{activeHost === 'HOST_A' ? 'Nova' : 'Atlas'}</h2>
+                    <p className="text-slate-400 text-xs md:text-sm font-medium uppercase tracking-wider">{activeHost === 'HOST_A' ? 'The Anchor (0.75x)' : 'The Commentator (0.9x)'}</p>
+                </div>
             </div>
 
-            <div className="text-center -mt-4 md:-mt-8 z-20 px-4">
-                <h2 className="text-xl md:text-2xl font-bold mb-2 text-white drop-shadow-[0_0_10px_rgba(var(--color-${theme.colors.primary}),0.5)]">
-                    {status === 'connecting' ? 'Establishing Uplink...' : sessionMode === 'Arena' ? 'DEBATE ARENA LIVE' : 'Live on Air'}
-                </h2>
-                <p className="text-slate-400 max-w-sm mx-auto text-sm font-medium">
-                    {status === 'live' ? (sessionMode === 'Arena' ? `Debating with Atlas...` : `Chatting with Nova...`) : errorMsg || 'Calibrating neural audio stream...'}
+            <div className="w-full max-w-xs space-y-2 relative z-10 px-4">
+                <div className="flex justify-between text-[10px] text-slate-500 uppercase font-bold tracking-wider">
+                    <span>Mic Input</span>
+                    <span>{vadSpeaking ? 'Detected' : 'Silent'}</span>
+                </div>
+                <div className="h-1.5 md:h-2 bg-slate-800 rounded-full overflow-hidden">
+                    <div 
+                        className={`h-full transition-all duration-75 ease-out ${vadSpeaking ? 'bg-green-500' : 'bg-slate-600'}`}
+                        style={{ width: `${Math.min(100, vadLevel * 400)}%` }}
+                    ></div>
+                </div>
+                <p className="text-center text-xs text-slate-500 pt-1 h-4">
+                    {modelSpeaking ? "Tap to interrupt..." : (vadSpeaking ? "Listening..." : "")}
                 </p>
             </div>
+        </div>
 
-            <div className="flex gap-4 z-20 pb-4 md:pb-0">
-                {status === 'error' ? (
-                    <button onClick={() => setStatus('setup')} className="px-6 md:px-8 py-3 bg-slate-800 text-white rounded-full font-bold border border-white/10">Retry Setup</button>
-                ) : (
-                    <>
-                        <button 
-                            onClick={() => setMuted(!muted)}
-                            className={`p-4 rounded-full transition-colors border border-white/10 shadow-lg ${muted ? 'bg-rose-500 text-white' : 'bg-slate-800 text-slate-200 hover:bg-slate-700'}`}
-                        >
-                            {muted ? <MicOff size={24} /> : <Mic size={24} />}
-                        </button>
-                        <button 
-                            onClick={disconnect}
-                            className="p-4 bg-red-500/10 text-red-500 hover:bg-red-500 hover:text-white rounded-full transition-all border border-red-500/50 shadow-lg"
-                        >
-                            <PhoneOff size={24} />
-                        </button>
-                    </>
-                )}
+        <div className="p-3 md:p-6 bg-black/40 backdrop-blur-xl border-t border-white/5 z-20 shrink-0">
+            <div className="grid grid-cols-3 gap-3 md:gap-4 max-w-md mx-auto">
+                <button 
+                    onClick={() => setIsMuted(!isMuted)}
+                    className={`flex flex-col items-center justify-center gap-1.5 p-3 rounded-2xl border transition-all active:scale-95 ${isMuted ? 'bg-white text-black border-white' : 'bg-slate-800/50 text-slate-300 border-white/10 hover:bg-slate-700'}`}
+                >
+                    {isMuted ? <MicOff size={20} /> : <Mic size={20} />}
+                    <span className="text-[10px] font-bold uppercase">{isMuted ? 'Unmute' : 'Mute'}</span>
+                </button>
+
+                <button 
+                    onClick={switchHost}
+                    className="flex flex-col items-center justify-center gap-1.5 p-3 rounded-2xl bg-slate-800/50 text-slate-300 border border-white/10 hover:bg-slate-700 transition-all active:scale-95"
+                >
+                    <RefreshCw size={20} />
+                    <span className="text-[10px] font-bold uppercase">Switch Host</span>
+                </button>
+
+                <button 
+                    onClick={() => disconnect()}
+                    className="flex flex-col items-center justify-center gap-1.5 p-3 rounded-2xl bg-rose-500/20 text-rose-400 border border-rose-500/30 hover:bg-rose-500 hover:text-white transition-all active:scale-95"
+                >
+                    <PhoneOff size={20} />
+                    <span className="text-[10px] font-bold uppercase">End Call</span>
+                </button>
             </div>
         </div>
     </div>

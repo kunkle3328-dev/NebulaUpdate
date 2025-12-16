@@ -2,9 +2,9 @@
 import React, { useState } from 'react';
 import { Notebook, Artifact, AudioOverviewDialogue } from '../types';
 import { generateAudioOverviewDialogue } from '../services/audioOverview';
-import { RefreshCw, Save, Copy, CheckCircle, AlertCircle, Sparkles, Mic2, Clock, Music, Users, GraduationCap, Flame, Coffee, Newspaper, BookOpen, Mic } from 'lucide-react';
+import { RefreshCw, Save, Copy, CheckCircle, AlertCircle, Sparkles, Mic2, Clock, Music, Users, GraduationCap, Flame, Coffee, Newspaper, BookOpen, Mic, Loader2, BrainCircuit } from 'lucide-react';
 import { useTheme } from '../contexts';
-import { VOICES, PODCAST_STYLES } from '../constants';
+import { VOICES, PODCAST_STYLES, STUDY_STYLES } from '../constants';
 
 interface Props {
   notebook: Notebook;
@@ -18,8 +18,9 @@ const AudioOverviewPanel: React.FC<Props> = ({ notebook, onSaveArtifact }) => {
   const [topic, setTopic] = useState(notebook.title);
   const [duration, setDuration] = useState<"short" | "medium" | "long">("medium");
   const [style, setStyle] = useState('Deep Dive');
-  const [voiceA, setVoiceA] = useState('Orus'); // Default to Orus (Male)
-  const [voiceB, setVoiceB] = useState('Aoede'); // Default to Aoede (Female)
+  const [studyStyle, setStudyStyle] = useState('Socratic'); // New State for Learning Styles
+  const [voiceA, setVoiceA] = useState('Aoede'); 
+  const [voiceB, setVoiceB] = useState('Orus'); 
   
   // Generation State
   const [status, setStatus] = useState<'idle' | 'generating' | 'completed' | 'error'>('idle');
@@ -31,7 +32,7 @@ const AudioOverviewPanel: React.FC<Props> = ({ notebook, onSaveArtifact }) => {
     if (!topic.trim()) return;
     setStatus('generating');
     setError('');
-    setProgressStep('Initializing...');
+    setProgressStep('Initializing Nebula Producer...');
 
     try {
       const dialogue = await generateAudioOverviewDialogue(
@@ -39,7 +40,8 @@ const AudioOverviewPanel: React.FC<Props> = ({ notebook, onSaveArtifact }) => {
         topic, 
         duration, 
         style,
-        (step) => setProgressStep(step)
+        (step) => setProgressStep(step),
+        style === 'Study Guide' ? studyStyle : undefined // Pass Study Style if active
       );
       
       // Store voice config
@@ -84,21 +86,35 @@ const AudioOverviewPanel: React.FC<Props> = ({ notebook, onSaveArtifact }) => {
   };
 
   return (
-    <div className="h-full flex flex-col gap-6">
+    <div className="h-full flex flex-col gap-6 relative">
       
       {/* 1. Configuration Section */}
       {status === 'idle' || status === 'generating' || status === 'error' ? (
-        <div className="flex flex-col items-center justify-center h-full p-4 md:p-6 animate-in fade-in overflow-y-auto custom-scrollbar">
-           <div className="w-full max-w-3xl space-y-8 pb-10">
-              <div className="text-center space-y-2 px-4">
-                 <div className={`w-16 h-16 mx-auto rounded-2xl bg-gradient-to-br from-${theme.colors.primary}-500 to-${theme.colors.secondary}-600 flex items-center justify-center shadow-lg shadow-${theme.colors.primary}-500/20 mb-6`}>
-                    <Mic2 size={32} className="text-white" />
+        <div className="flex flex-col items-center md:justify-center h-full w-full overflow-y-auto custom-scrollbar">
+           <div className="w-full max-w-3xl space-y-6 md:space-y-8 p-4 pb-24 md:p-6 md:pb-10">
+              <div className="text-center space-y-2 px-2">
+                 <div className={`w-14 h-14 md:w-16 md:h-16 mx-auto rounded-2xl bg-gradient-to-br from-${theme.colors.primary}-500 to-${theme.colors.secondary}-600 flex items-center justify-center shadow-lg shadow-${theme.colors.primary}-500/20 mb-4 md:mb-6`}>
+                    <Mic2 size={28} className="text-white md:w-8 md:h-8" />
                  </div>
                  <h2 className="text-2xl md:text-4xl font-bold text-white leading-tight">Audio Overview Director</h2>
                  <p className="text-slate-400 text-sm md:text-base max-w-lg mx-auto">Configure your AI podcast hosts and generation style.</p>
               </div>
 
-              <div className="glass-panel p-5 md:p-8 rounded-3xl space-y-8 border border-white/10">
+              <div className="glass-panel p-4 md:p-8 rounded-3xl space-y-6 md:space-y-8 border border-white/10 relative">
+                 {/* LOADING OVERLAY */}
+                 {status === 'generating' && (
+                     <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-sm rounded-3xl flex flex-col items-center justify-center p-8 text-center animate-in fade-in">
+                         <div className={`w-20 h-20 rounded-full border-4 border-t-transparent border-${theme.colors.primary}-500 animate-spin mb-6`}></div>
+                         <h3 className="text-2xl font-bold text-white mb-2">{progressStep}</h3>
+                         <p className="text-slate-400 max-w-sm mb-8">AI Agents are analyzing your sources, drafting the script, and rehearsing the dialogue.</p>
+                         
+                         <div className="flex items-center gap-2 text-xs text-slate-500 font-mono bg-white/5 px-4 py-2 rounded-full">
+                             <Clock size={12} className={`text-${theme.colors.primary}-400`} />
+                             <span>* Estimated time: 2-5 minutes</span>
+                         </div>
+                     </div>
+                 )}
+
                  {/* TOPIC & DURATION */}
                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                      <div className="space-y-2">
@@ -148,10 +164,32 @@ const AudioOverviewPanel: React.FC<Props> = ({ notebook, onSaveArtifact }) => {
                             </button>
                         ))}
                     </div>
-                    <p className="text-xs text-slate-500 text-center italic mt-2">
-                        {PODCAST_STYLES.find(s => s.id === style)?.desc}
-                    </p>
                  </div>
+
+                 {/* SUB-STYLE FOR STUDY GUIDE (NEW) */}
+                 {style === 'Study Guide' && (
+                     <div className="space-y-3 animate-in fade-in slide-in-from-top-2">
+                        <label className="text-xs font-bold text-slate-500 uppercase tracking-wider flex items-center gap-2">
+                            <BrainCircuit size={14} /> Pedagogical Method
+                        </label>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            {STUDY_STYLES.map((s) => (
+                                <button
+                                    key={s.id}
+                                    onClick={() => setStudyStyle(s.id)}
+                                    disabled={status === 'generating'}
+                                    className={`flex items-center gap-3 p-3 rounded-xl border transition-all text-left ${studyStyle === s.id ? `bg-${theme.colors.secondary}-500/20 border-${theme.colors.secondary}-500 text-white` : 'bg-slate-900 border-slate-800 text-slate-400 hover:bg-slate-800'}`}
+                                >
+                                    <div className="flex-1">
+                                        <div className="text-xs font-bold">{s.label}</div>
+                                        <div className="text-[10px] text-slate-500 mt-1 leading-tight">{s.desc}</div>
+                                    </div>
+                                    {studyStyle === s.id && <CheckCircle size={16} className={`text-${theme.colors.secondary}-400`} />}
+                                </button>
+                            ))}
+                        </div>
+                     </div>
+                 )}
 
                  {/* VOICE SELECTION */}
                  <div className="space-y-3">
@@ -161,7 +199,9 @@ const AudioOverviewPanel: React.FC<Props> = ({ notebook, onSaveArtifact }) => {
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                         {/* Host A */}
                         <div className="p-3 bg-slate-900 rounded-xl border border-slate-800">
-                             <span className="text-[10px] text-indigo-400 font-bold uppercase mb-2 block">Nova (Host A)</span>
+                             <span className="text-[10px] text-indigo-400 font-bold uppercase mb-2 block">
+                                {style === 'Study Guide' ? 'Professor A (Lead)' : 'Nova (Host A)'}
+                             </span>
                              <div className="grid grid-cols-2 gap-2">
                                 {VOICES.jane.map((v) => (
                                     <button 
@@ -176,7 +216,9 @@ const AudioOverviewPanel: React.FC<Props> = ({ notebook, onSaveArtifact }) => {
                         </div>
                         {/* Host B */}
                         <div className="p-3 bg-slate-900 rounded-xl border border-slate-800">
-                             <span className="text-[10px] text-teal-400 font-bold uppercase mb-2 block">Atlas (Host B)</span>
+                             <span className="text-[10px] text-teal-400 font-bold uppercase mb-2 block">
+                                {style === 'Study Guide' ? 'Professor B (Support)' : 'Atlas (Host B)'}
+                             </span>
                              <div className="grid grid-cols-2 gap-2">
                                 {VOICES.joe.map((v) => (
                                     <button 
@@ -207,7 +249,7 @@ const AudioOverviewPanel: React.FC<Props> = ({ notebook, onSaveArtifact }) => {
                     {status === 'generating' ? (
                        <>
                          <RefreshCw className="animate-spin" size={20} />
-                         <span>{progressStep}</span>
+                         <span>Generating...</span>
                        </>
                     ) : (
                        <>
@@ -245,7 +287,7 @@ const AudioOverviewPanel: React.FC<Props> = ({ notebook, onSaveArtifact }) => {
            </div>
 
            {/* Script Viewer */}
-           <div className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 custom-scrollbar">
+           <div className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 custom-scrollbar pb-24 md:pb-8">
               {/* Cold Open */}
               <div className="glass-panel p-6 rounded-xl border-l-4 border-purple-500 bg-purple-900/10">
                  <span className="text-[10px] font-bold text-purple-400 uppercase tracking-wider mb-2 block">Cold Open</span>
